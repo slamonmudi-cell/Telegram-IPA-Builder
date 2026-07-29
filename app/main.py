@@ -8,7 +8,9 @@ from pathlib import Path
 
 from telegram import Update
 from telegram.constants import ChatAction
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.request import HTTPXRequest
 
 from .archive import UnsafeArchive, extract_project, locate_project_root
 from .config import Settings
@@ -19,8 +21,52 @@ logging.basicConfig(
     level=logging.INFO,
 )
 LOGGER = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 SETTINGS = Settings.from_env()
 BUILD_LOCK = asyncio.Semaphore(2)
+
+
+async def _send_preview(message, preview: Path, job_id: str) -> bool:
+    for attempt in range(1, 4):
+        try:
+            with preview.open("rb") as preview_file:
+                await message.reply_photo(
+                    photo=preview_file,
+                    caption=f"معاينة التطبيق — الطلب {job_id}",
+                    read_timeout=120,
+                    write_timeout=180,
+                    connect_timeout=30,
+                    pool_timeout=30,
+                )
+            return True
+        except (TimedOut, NetworkError) as exc:
+            LOGGER.warning("Preview upload attempt %s failed: %s", attempt, type(exc).__name__)
+            if attempt < 3:
+                await asyncio.sleep(attempt * 3)
+    return False
+
+
+async def _send_ipa(message, ipa: Path, job_id: str) -> None:
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            with ipa.open("rb") as ipa_file:
+                await message.reply_document(
+                    document=ipa_file,
+                    filename=f"{job_id}-unsigned.ipa",
+                    caption="تم البناء بنجاح. هذا IPA غير موقّع.",
+                    read_timeout=180,
+                    write_timeout=300,
+                    connect_timeout=30,
+                    pool_timeout=30,
+                )
+            return
+        except (TimedOut, NetworkError) as exc:
+            last_error = exc
+            LOGGER.warning("IPA upload attempt %s failed: %s", attempt, type(exc).__name__)
+            if attempt < 3:
+                await asyncio.sleep(attempt * 5)
+    raise TimedOut("Telegram could not receive the IPA after three attempts") from last_error
 
 
 def _authorized(update: Update) -> bool:
@@ -119,10 +165,11 @@ async def build_zip(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                         raise GitHubError("نجح البناء لكن ملف IPA غير موجود")
 
                     if preview:
-                        with preview.open("rb") as preview_file:
-                            await message.reply_photo(
-                                photo=preview_file,
-                                caption=f"معاينة التطبيق — الطلب {job_id}",
+                        preview_sent = await _send_preview(message, preview, job_id)
+                        if not preview_sent:
+                            await status.edit_text(
+                                "اكتمل البناء، لكن تيليجرام لم يستقبل صورة المعاينة. "
+                                "سأتابع الآن وأرسل ملف IPA."
                             )
 
                     if ipa.stat().st_size > SETTINGS.telegram_max_upload_mb * 1024 * 1024:
@@ -133,15 +180,10 @@ async def build_zip(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                         return
 
                     await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-                    with ipa.open("rb") as ipa_file:
-                        await message.reply_document(
-                            document=ipa_file,
-                            filename=f"{job_id}-unsigned.ipa",
-                            caption="تم البناء بنجاح. هذا IPA غير موقّع.",
-                        )
+                    await _send_ipa(message, ipa, job_id)
                     await status.edit_text("اكتمل البناء والإرسال بنجاح ✅")
 
-        except (UnsafeArchive, GitHubError, OSError, ValueError) as exc:
+        except (UnsafeArchive, GitHubError, OSError, ValueError, TimedOut, NetworkError) as exc:
             LOGGER.exception("Build %s failed", job_id)
             await status.edit_text(f"تعذر إكمال البناء:\n{str(exc)[:3500]}")
         except Exception:
@@ -159,7 +201,24 @@ async def build_zip(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
-    application = Application.builder().token(SETTINGS.telegram_token).build()
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        connect_timeout=30,
+        read_timeout=120,
+        write_timeout=120,
+        pool_timeout=30,
+        media_write_timeout=300,
+    )
+    application = (
+        Application.builder()
+        .token(SETTINGS.telegram_token)
+        .request(request)
+        .get_updates_connect_timeout(30)
+        .get_updates_read_timeout(60)
+        .get_updates_write_timeout(60)
+        .get_updates_pool_timeout(30)
+        .build()
+    )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("whoami", whoami))
     application.add_handler(MessageHandler(filters.Document.ALL, build_zip))
