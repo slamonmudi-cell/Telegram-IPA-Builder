@@ -11,6 +11,11 @@ on:
         description: Relative path to the uploaded XcodeGen project
         required: true
         type: string
+      make_preview:
+        description: Build simulator and capture preview
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -22,7 +27,7 @@ jobs:
 
     steps:
       - name: Checkout temporary build branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
 
@@ -62,6 +67,7 @@ jobs:
           echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
 
       - name: Build simulator application
+        if: ${{ inputs.make_preview }}
         shell: bash
         working-directory: ${{ inputs.project_path }}
         env:
@@ -80,6 +86,7 @@ jobs:
             clean build
 
       - name: Capture real simulator preview
+        if: ${{ inputs.make_preview }}
         shell: bash
         run: |
           set -euo pipefail
@@ -149,7 +156,7 @@ jobs:
             echo "::error::Assets.car is missing from the device app bundle"
             exit 1
           }
-          mkdir -p "$RUNNER_TEMP/Payload"
+          mkdir -p "$RUNNER_TEMP/Payload" "$RUNNER_TEMP/Output"
           cp -R "$APP_PATH" "$RUNNER_TEMP/Payload/"
           cd "$RUNNER_TEMP"
           /usr/bin/ditto -c -k --sequesterRsrc --keepParent Payload "$RUNNER_TEMP/Output/app-unsigned.ipa"
