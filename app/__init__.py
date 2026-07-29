@@ -1,0 +1,1 @@
+"""Telegram IPA builder bot."""
