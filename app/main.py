@@ -5,12 +5,13 @@ import logging
 import tempfile
 import uuid
 from pathlib import Path
+from typing import Awaitable, Callable
+from urllib.parse import urlparse
 
+import httpx
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.error import NetworkError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-from telegram.request import HTTPXRequest
 
 from .archive import UnsafeArchive, extract_project, locate_project_root
 from .config import Settings
@@ -21,52 +22,16 @@ logging.basicConfig(
     level=logging.INFO,
 )
 LOGGER = logging.getLogger(__name__)
-logging.getLogger("httpx").setLevel(logging.WARNING)
 SETTINGS = Settings.from_env()
 BUILD_LOCK = asyncio.Semaphore(2)
-
-
-async def _send_preview(message, preview: Path, job_id: str) -> bool:
-    for attempt in range(1, 4):
-        try:
-            with preview.open("rb") as preview_file:
-                await message.reply_photo(
-                    photo=preview_file,
-                    caption=f"معاينة التطبيق — الطلب {job_id}",
-                    read_timeout=120,
-                    write_timeout=180,
-                    connect_timeout=30,
-                    pool_timeout=30,
-                )
-            return True
-        except (TimedOut, NetworkError) as exc:
-            LOGGER.warning("Preview upload attempt %s failed: %s", attempt, type(exc).__name__)
-            if attempt < 3:
-                await asyncio.sleep(attempt * 3)
-    return False
-
-
-async def _send_ipa(message, ipa: Path, job_id: str) -> None:
-    last_error: Exception | None = None
-    for attempt in range(1, 4):
-        try:
-            with ipa.open("rb") as ipa_file:
-                await message.reply_document(
-                    document=ipa_file,
-                    filename=f"{job_id}-unsigned.ipa",
-                    caption="تم البناء بنجاح. هذا IPA غير موقّع.",
-                    read_timeout=180,
-                    write_timeout=300,
-                    connect_timeout=30,
-                    pool_timeout=30,
-                )
-            return
-        except (TimedOut, NetworkError) as exc:
-            last_error = exc
-            LOGGER.warning("IPA upload attempt %s failed: %s", attempt, type(exc).__name__)
-            if attempt < 3:
-                await asyncio.sleep(attempt * 5)
-    raise TimedOut("Telegram could not receive the IPA after three attempts") from last_error
+ALLOWED_DOWNLOAD_HOSTS = {
+    "github.com",
+    "api.github.com",
+    "codeload.github.com",
+    "objects.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+}
 
 
 def _authorized(update: Update) -> bool:
@@ -109,6 +74,65 @@ async def build_zip(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text(f"حجم ZIP يجب ألا يتجاوز {SETTINGS.max_zip_mb} MB.")
         return
 
+    async def download_to(zip_path: Path) -> None:
+        telegram_file = await document.get_file()
+        await telegram_file.download_to_drive(zip_path)
+
+    await _build_project(update, download_to)
+
+
+async def build_url(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not _authorized(update):
+        await message.reply_text("غير مصرح لك باستخدام هذا البوت.")
+        return
+
+    url = (message.text or "").strip()
+    parsed = urlparse(url)
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() not in ALLOWED_DOWNLOAD_HOSTS
+        or not parsed.path.lower().endswith(".zip")
+    ):
+        await message.reply_text("أرسل رابط تنزيل مباشر لملف ZIP من GitHub Releases.")
+        return
+
+    async def download_to(zip_path: Path) -> None:
+        await _download_zip_url(url, zip_path)
+
+    await _build_project(update, download_to)
+
+
+async def _download_zip_url(url: str, destination: Path) -> None:
+    limit = SETTINGS.max_zip_mb * 1024 * 1024
+    total = 0
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(120.0, connect=20.0),
+    ) as client:
+        async with client.stream("GET", url) as response:
+            response.raise_for_status()
+            final_host = (response.url.host or "").lower()
+            if final_host not in ALLOWED_DOWNLOAD_HOSTS:
+                raise ValueError("رابط التحويل النهائي ليس من GitHub.")
+            content_length = response.headers.get("content-length")
+            if content_length and int(content_length) > limit:
+                raise ValueError(f"حجم ZIP يجب ألا يتجاوز {SETTINGS.max_zip_mb} MB.")
+            with destination.open("wb") as output:
+                async for chunk in response.aiter_bytes(1024 * 1024):
+                    total += len(chunk)
+                    if total > limit:
+                        raise ValueError(
+                            f"حجم ZIP يجب ألا يتجاوز {SETTINGS.max_zip_mb} MB."
+                        )
+                    output.write(chunk)
+
+
+async def _build_project(
+    update: Update,
+    download_to: Callable[[Path], Awaitable[None]],
+) -> None:
+    message = update.effective_message
     job_id = uuid.uuid4().hex[:12]
     status = await message.reply_text(f"بدأ الطلب `{job_id}`… جاري تنزيل المشروع.", parse_mode="Markdown")
 
@@ -119,8 +143,7 @@ async def build_zip(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                 temp_path = Path(temp)
                 zip_path = temp_path / "project.zip"
                 await message.chat.send_action(ChatAction.TYPING)
-                telegram_file = await document.get_file()
-                await telegram_file.download_to_drive(zip_path)
+                await download_to(zip_path)
 
                 project_extract = temp_path / "project"
                 extract_project(
@@ -165,11 +188,10 @@ async def build_zip(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                         raise GitHubError("نجح البناء لكن ملف IPA غير موجود")
 
                     if preview:
-                        preview_sent = await _send_preview(message, preview, job_id)
-                        if not preview_sent:
-                            await status.edit_text(
-                                "اكتمل البناء، لكن تيليجرام لم يستقبل صورة المعاينة. "
-                                "سأتابع الآن وأرسل ملف IPA."
+                        with preview.open("rb") as preview_file:
+                            await message.reply_photo(
+                                photo=preview_file,
+                                caption=f"معاينة التطبيق — الطلب {job_id}",
                             )
 
                     if ipa.stat().st_size > SETTINGS.telegram_max_upload_mb * 1024 * 1024:
@@ -180,10 +202,21 @@ async def build_zip(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                         return
 
                     await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-                    await _send_ipa(message, ipa, job_id)
+                    with ipa.open("rb") as ipa_file:
+                        await message.reply_document(
+                            document=ipa_file,
+                            filename=f"{job_id}-unsigned.ipa",
+                            caption="تم البناء بنجاح. هذا IPA غير موقّع.",
+                        )
                     await status.edit_text("اكتمل البناء والإرسال بنجاح ✅")
 
-        except (UnsafeArchive, GitHubError, OSError, ValueError, TimedOut, NetworkError) as exc:
+        except (
+            UnsafeArchive,
+            GitHubError,
+            httpx.HTTPError,
+            OSError,
+            ValueError,
+        ) as exc:
             LOGGER.exception("Build %s failed", job_id)
             await status.edit_text(f"تعذر إكمال البناء:\n{str(exc)[:3500]}")
         except Exception:
@@ -201,27 +234,11 @@ async def build_zip(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
-    request = HTTPXRequest(
-        connection_pool_size=8,
-        connect_timeout=30,
-        read_timeout=120,
-        write_timeout=120,
-        pool_timeout=30,
-        media_write_timeout=300,
-    )
-    application = (
-        Application.builder()
-        .token(SETTINGS.telegram_token)
-        .request(request)
-        .get_updates_connect_timeout(30)
-        .get_updates_read_timeout(60)
-        .get_updates_write_timeout(60)
-        .get_updates_pool_timeout(30)
-        .build()
-    )
+    application = Application.builder().token(SETTINGS.telegram_token).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("whoami", whoami))
     application.add_handler(MessageHandler(filters.Document.ALL, build_zip))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, build_url))
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
