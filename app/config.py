@@ -48,5 +48,5 @@ class Settings:
             max_unpacked_mb=int(os.getenv("MAX_UNPACKED_MB", "500")),
             max_files=int(os.getenv("MAX_FILES", "1200")),
             build_timeout_minutes=int(os.getenv("BUILD_TIMEOUT_MINUTES", "35")),
-            telegram_max_upload_mb=int(os.getenv("TELEGRAM_MAX_UPLOAD_MB", "49")),
+            telegram_max_upload_mb=int(os.getenv("TELEGRAM_MAX_UPLOAD_MB", "100")),
         )
